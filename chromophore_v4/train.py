@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from model      import build_model, inspect_decoder_channels
-from loss       import ChromophoreLoss, AmbientInvariantLoss, get_loss_weights
+from loss       import ChromophoreLoss, AmbientInvariantLoss, IlluminantConsistencyLoss, get_loss_weights
 from dataset    import PatchDataset
 from ambient_aug import get_ambient_transform, apply_ambient_aug
 
@@ -56,6 +56,12 @@ CFG = dict(
     use_patch_feat  = False,      # patch token도 consistency loss에 사용
     patch_feat_w    = 0.5,        # patch token loss 가중치
     w_feat          = 0.5,        # feature consistency loss 전체 가중치
+
+    # Illuminant Consistency Loss 설정 (Beer-Lambert 잔차 기반)
+    w_illum         = 0.3,        # illuminant loss 전체 가중치
+    illum_smooth    = 1.0,        # 공간 평활도 가중치
+    illum_spectral  = 0.5,        # 스펙트럼 일관성 가중치
+    illum_augment   = 1.0,        # 조명 뷰 간 일관성 가중치
 
     # Chromophore Loss 초기 가중치 (get_loss_weights로 단계적 조절)
     w_supervised    = 1.0,
@@ -127,13 +133,14 @@ def make_ambient_batch(rgb        : torch.Tensor,
 # ══════════════════════════════════════════════════════════════════════════════
 # 학습 / 검증
 # ══════════════════════════════════════════════════════════════════════════════
-def train_one_epoch(model, loader, chroma_loss, feat_loss,
+def train_one_epoch(model, loader, chroma_loss, feat_loss, illum_loss,
                     ambient_transform, optimizer, device, cfg):
     model.train()
 
     total_loss   = 0.0
     chroma_log   = {k: 0.0 for k in ['sup', 'ssim', 'recon', 'ortho', 'smooth']}
     feat_log     = {'feat_cls': 0.0, 'feat_patch': 0.0}
+    illum_log    = {'illum_smooth': 0.0, 'illum_spectral': 0.0, 'illum_augment': 0.0}
 
     for batch in loader:
         rgb       = batch['rgb'].to(device)         # [B, 3, H, W]
@@ -144,14 +151,17 @@ def train_one_epoch(model, loader, chroma_loss, feat_loss,
         # ── 조명변형 이미지 생성 ─────────────────────────────────────────────
         rgb_aug = make_ambient_batch(rgb, ambient_transform, device)
 
-        # ── Forward: 원본 (mel/hem + feature 반환) ───────────────────────────
-        mel_pred, hem_pred, cls_orig, patch_orig = model(
+        # ── Forward: 원본 (mel/hem + feature + log_rgb 반환) ─────────────────
+        mel_pred, hem_pred, cls_orig, patch_orig, log_rgb = model(
             rgb, return_feat=True
         )
 
-        # ── Forward: 조명변형 (feature만 사용) ──────────────────────────────
-        with torch.no_grad() if cfg['freeze_dino'] else torch.enable_grad():
-            _, _, cls_aug, patch_aug = model(rgb_aug, return_feat=True)
+        # ── Forward: 조명변형 (feature + log_rgb 반환) ───────────────────────
+        ctx = torch.no_grad() if cfg['freeze_dino'] else torch.enable_grad()
+        with ctx:
+            mel_aug, hem_aug, cls_aug, patch_aug, log_rgb_aug = model(
+                rgb_aug, return_feat=True
+            )
 
         # ── Chromophore Loss (mel/hem 분리) ──────────────────────────────────
         loss_c, detail_c = chroma_loss(
@@ -163,7 +173,7 @@ def train_one_epoch(model, loader, chroma_loss, feat_loss,
             face_mask  = face_mask,
         )
 
-        # ── Feature Consistency Loss (주변광 불변) ───────────────────────────
+        # ── Feature Consistency Loss (주변광 불변 feature) ───────────────────
         loss_f, detail_f = feat_loss(
             cls_orig   = cls_orig,
             cls_aug    = cls_aug,
@@ -171,8 +181,21 @@ def train_one_epoch(model, loader, chroma_loss, feat_loss,
             patch_aug  = patch_aug  if cfg['use_patch_feat'] else None,
         )
 
+        # ── Illuminant Consistency Loss (Beer-Lambert 잔차) ──────────────────
+        loss_i, detail_i, _ = illum_loss(
+            log_rgb     = log_rgb,
+            mel_pred    = mel_pred,
+            hem_pred    = hem_pred,
+            face_mask   = face_mask,
+            log_rgb_aug = log_rgb_aug,
+            mel_aug     = mel_aug.detach(),
+            hem_aug     = hem_aug.detach(),
+        )
+
         # ── 합산 ────────────────────────────────────────────────────────────
-        total = loss_c + cfg['w_feat'] * loss_f
+        total = (loss_c
+                 + cfg['w_feat']  * loss_f
+                 + cfg['w_illum'] * loss_i)
 
         optimizer.zero_grad()
         total.backward()
@@ -184,24 +207,28 @@ def train_one_epoch(model, loader, chroma_loss, feat_loss,
             chroma_log[k] += detail_c.get(k, 0.0)
         for k in feat_log:
             feat_log[k] += detail_f.get(k, 0.0)
+        for k in illum_log:
+            illum_log[k] += detail_i.get(k, 0.0)
 
     n = len(loader)
     log = {
         'total'      : total_loss / n,
         **{k: v / n for k, v in chroma_log.items()},
         **{k: v / n for k, v in feat_log.items()},
+        **{k: v / n for k, v in illum_log.items()},
     }
     return log
 
 
 @torch.no_grad()
-def validate(model, loader, chroma_loss, feat_loss,
+def validate(model, loader, chroma_loss, feat_loss, illum_loss,
              ambient_transform, device, cfg):
     model.eval()
 
     total_loss = 0.0
     chroma_log = {k: 0.0 for k in ['sup', 'ssim', 'recon', 'ortho', 'smooth']}
     feat_log   = {'feat_cls': 0.0, 'feat_patch': 0.0}
+    illum_log  = {'illum_smooth': 0.0, 'illum_spectral': 0.0, 'illum_augment': 0.0}
 
     for batch in loader:
         rgb       = batch['rgb'].to(device)
@@ -211,10 +238,12 @@ def validate(model, loader, chroma_loss, feat_loss,
 
         rgb_aug = make_ambient_batch(rgb, ambient_transform, device)
 
-        mel_pred, hem_pred, cls_orig, patch_orig = model(
+        mel_pred, hem_pred, cls_orig, patch_orig, log_rgb = model(
             rgb, return_feat=True
         )
-        _, _, cls_aug, patch_aug = model(rgb_aug, return_feat=True)
+        mel_aug, hem_aug, cls_aug, patch_aug, log_rgb_aug = model(
+            rgb_aug, return_feat=True
+        )
 
         loss_c, detail_c = chroma_loss(
             mel_pred, hem_pred, mel_gt, hem_gt, rgb, face_mask
@@ -225,20 +254,34 @@ def validate(model, loader, chroma_loss, feat_loss,
             patch_orig = patch_orig if cfg['use_patch_feat'] else None,
             patch_aug  = patch_aug  if cfg['use_patch_feat'] else None,
         )
+        loss_i, detail_i, _ = illum_loss(
+            log_rgb     = log_rgb,
+            mel_pred    = mel_pred,
+            hem_pred    = hem_pred,
+            face_mask   = face_mask,
+            log_rgb_aug = log_rgb_aug,
+            mel_aug     = mel_aug,
+            hem_aug     = hem_aug,
+        )
 
-        total = loss_c + cfg['w_feat'] * loss_f
+        total = (loss_c
+                 + cfg['w_feat']  * loss_f
+                 + cfg['w_illum'] * loss_i)
         total_loss += total.item()
 
         for k in chroma_log:
             chroma_log[k] += detail_c.get(k, 0.0)
         for k in feat_log:
             feat_log[k] += detail_f.get(k, 0.0)
+        for k in illum_log:
+            illum_log[k] += detail_i.get(k, 0.0)
 
     n = len(loader)
     log = {
         'total'      : total_loss / n,
         **{k: v / n for k, v in chroma_log.items()},
         **{k: v / n for k, v in feat_log.items()},
+        **{k: v / n for k, v in illum_log.items()},
     }
     return log
 
@@ -321,6 +364,12 @@ def main():
         patch_weight = CFG['patch_feat_w'],
     ).to(device)
 
+    illum_loss = IlluminantConsistencyLoss(
+        w_smooth   = CFG['illum_smooth'],
+        w_spectral = CFG['illum_spectral'],
+        w_augment  = CFG['illum_augment'],
+    ).to(device)
+
     # 조명 augmentation transform
     ambient_transform = get_ambient_transform()
 
@@ -350,11 +399,11 @@ def main():
             setattr(chroma_loss, k, v)
 
         train_log = train_one_epoch(
-            model, train_loader, chroma_loss, feat_loss,
+            model, train_loader, chroma_loss, feat_loss, illum_loss,
             ambient_transform, optimizer, device, CFG
         )
         val_log = validate(
-            model, val_loader, chroma_loss, feat_loss,
+            model, val_loader, chroma_loss, feat_loss, illum_loss,
             ambient_transform, device, CFG
         )
         scheduler.step()
@@ -366,6 +415,8 @@ def main():
             f"sup={val_log['sup']:.4f}  "
             f"recon={val_log['recon']:.4f}  "
             f"feat_cls={val_log['feat_cls']:.4f}  "
+            f"illum_sm={val_log['illum_smooth']:.4f}  "
+            f"illum_sp={val_log['illum_spectral']:.4f}  "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
 

@@ -315,6 +315,156 @@ class AmbientInvariantLoss(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Beer-Lambert Residual Illuminant Consistency Loss
+# ══════════════════════════════════════════════════════════════════════════════
+class IlluminantConsistencyLoss(nn.Module):
+    """
+    Beer-Lambert 잔차를 이용한 자기지도 조명 일관성 Loss
+
+    핵심 원리
+    ---------
+    Beer-Lambert:  RGB = illuminant × exp(-OD)
+    로그 도메인:   log(RGB) = log(illuminant) - OD
+    잔차 정의:     R := log(RGB_measured) - log(RGB_recon)
+                        = log(RGB_measured) + OD_recon
+                        ≈ log(illuminant)
+
+    → 잔차 R이 조명 추정치 역할. 실제 OD(chromophore)가 잘 분리될수록
+      R의 패턴이 조명의 물리적 특성과 일치해야 함.
+
+    Loss 구성
+    ---------
+    1. 공간 평활도 (TV): 조명은 공간적으로 서서히 변해야 함
+    2. 스펙트럼 일관성: 중성(회색) 조명 가정 시 채널 간 잔차가 균등해야 함
+       → 채널 간 편차 최소화
+    3. 조명변형 뷰 일관성 (선택): 두 조명 뷰의 잔차 차이가
+       공간적으로 균일한 패턴이어야 함 (illuminant ratio는 공간 무관)
+
+    Parameters
+    ----------
+    w_smooth    : 공간 평활도 가중치
+    w_spectral  : 스펙트럼 일관성 가중치
+    w_augment   : 조명 뷰 간 일관성 가중치 (augmented view 없으면 무시)
+    """
+
+    # Beer-Lambert 흡수 계수 [R, G, B] — ChromophoreLoss와 동일해야 함
+    _MEL_ABS = [0.28, 0.18, 0.09]
+    _HEM_ABS = [0.10, 0.35, 0.05]
+
+    def __init__(self,
+                 w_smooth  : float = 1.0,
+                 w_spectral: float = 0.5,
+                 w_augment : float = 1.0):
+        super().__init__()
+        self.w_smooth   = w_smooth
+        self.w_spectral = w_spectral
+        self.w_augment  = w_augment
+
+        mel_abs = torch.tensor(self._MEL_ABS).view(1, 3, 1, 1)
+        hem_abs = torch.tensor(self._HEM_ABS).view(1, 3, 1, 1)
+        self.register_buffer('mel_abs', mel_abs)
+        self.register_buffer('hem_abs', hem_abs)
+
+    def _residual(self,
+                  log_rgb : torch.Tensor,    # [B, 3, H, W]
+                  mel_pred: torch.Tensor,    # [B, 1, H, W]
+                  hem_pred: torch.Tensor,    # [B, 1, H, W]
+                  ) -> torch.Tensor:
+        """
+        Beer-Lambert 잔차 = log(illuminant) 추정치
+
+        log(RGB_recon) = -OD_recon = -(mel_pred*mel_abs + hem_pred*hem_abs)
+        잔차 = log_rgb − log_rgb_recon = log_rgb + OD_recon
+        """
+        od_recon  = mel_pred * self.mel_abs + hem_pred * self.hem_abs
+        log_recon = -od_recon                         # log(RGB_recon)
+        return log_rgb - log_recon                    # [B, 3, H, W]
+
+    @staticmethod
+    def _masked_tv(x: torch.Tensor,
+                   mask: torch.Tensor) -> torch.Tensor:
+        """마스크 내 공간 평활도 (Total Variation)"""
+        dh  = (x[:, :, 1:, :]  - x[:, :, :-1, :]).abs()
+        dw  = (x[:, :, :, 1:]  - x[:, :, :, :-1]).abs()
+        mh  = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        mw  = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+        tv  = (dh * mh).sum() / (mh.sum() + 1e-6)
+        tv += (dw * mw).sum() / (mw.sum() + 1e-6)
+        return tv
+
+    def forward(self,
+                log_rgb     : torch.Tensor,           # [B, 3, H, W]
+                mel_pred    : torch.Tensor,           # [B, 1, H, W]
+                hem_pred    : torch.Tensor,           # [B, 1, H, W]
+                face_mask   : torch.Tensor,           # [B, 1, H, W]
+                log_rgb_aug : torch.Tensor = None,    # [B, 3, H, W] (선택)
+                mel_aug     : torch.Tensor = None,    # [B, 1, H, W] (선택)
+                hem_aug     : torch.Tensor = None,    # [B, 1, H, W] (선택)
+                ) -> tuple:
+        """
+        Parameters
+        ----------
+        log_rgb     : model.forward(return_feat=True)로 얻은 log(RGB)
+        mel_pred    : 원본 뷰 melanin 예측
+        hem_pred    : 원본 뷰 hemoglobin 예측
+        face_mask   : [B, 1, H, W] 피부 영역 마스크
+        log_rgb_aug : 조명 변형 뷰 log(RGB) (선택)
+        mel_aug     : 조명 변형 뷰 melanin 예측 (선택)
+        hem_aug     : 조명 변형 뷰 hemoglobin 예측 (선택)
+
+        Returns
+        -------
+        total    : scalar loss
+        detail   : dict
+        residual : [B, 3, H, W]  log(illuminant) 추정치 (시각화/디버그용)
+        """
+        mask_3ch = face_mask.expand(-1, 3, -1, -1)   # [B, 3, H, W]
+
+        # ── Beer-Lambert 잔차 ─────────────────────────────────────────────────
+        residual = self._residual(log_rgb, mel_pred, hem_pred)   # [B, 3, H, W]
+
+        # ── Loss 1: 공간 평활도 ───────────────────────────────────────────────
+        l_smooth = self._masked_tv(residual, mask_3ch)
+
+        # ── Loss 2: 스펙트럼 일관성 ───────────────────────────────────────────
+        # 중성 조명: log(I_R) ≈ log(I_G) ≈ log(I_B)
+        # 채널 간 편차 최소화 → 잔차가 채널에 무관하게 동일해야 함
+        res_masked   = residual * mask_3ch                        # [B, 3, H, W]
+        ch_mean      = res_masked.mean(dim=1, keepdim=True)       # [B, 1, H, W]
+        ch_deviation = (res_masked - ch_mean).pow(2) * mask_3ch
+        denom        = mask_3ch.sum() + 1e-6
+        l_spectral   = ch_deviation.sum() / denom
+
+        total  = self.w_smooth * l_smooth + self.w_spectral * l_spectral
+        detail = {
+            'illum_total'   : total.item(),
+            'illum_smooth'  : l_smooth.item(),
+            'illum_spectral': l_spectral.item(),
+            'illum_augment' : 0.0,
+        }
+
+        # ── Loss 3: 조명변형 뷰 간 일관성 (선택) ─────────────────────────────
+        if (log_rgb_aug is not None
+                and mel_aug is not None
+                and hem_aug is not None):
+            residual_aug = self._residual(log_rgb_aug, mel_aug, hem_aug)
+
+            # 두 잔차의 차이 = 두 조명 비율의 로그
+            # 조명 비율은 공간에 무관 → 차이의 공간 분산이 0에 가까워야 함
+            res_diff = (residual - residual_aug) * mask_3ch        # [B, 3, H, W]
+            # 픽셀 평균 제거 후 분산
+            diff_mean = res_diff.sum(dim=[2, 3], keepdim=True) / \
+                        (mask_3ch.sum(dim=[2, 3], keepdim=True) + 1e-6)
+            l_aug = ((res_diff - diff_mean).pow(2) * mask_3ch).sum() / denom
+
+            total                  += self.w_augment * l_aug
+            detail['illum_augment'] = l_aug.item()
+            detail['illum_total']   = total.item()
+
+        return total, detail, residual
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 학습 단계별 Loss 가중치 스케줄러
 # ══════════════════════════════════════════════════════════════════════════════
 def get_loss_weights(epoch: int, total_epochs: int) -> dict:

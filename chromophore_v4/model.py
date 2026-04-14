@@ -2,8 +2,9 @@
 model.py
 ========
 ChromophoreNet
+  LogAbsorbanceInput (trainable): RGB → log-absorbance + channel ratio → DINOv2 입력
   DINOv2 (frozen)   : 주변광 불변 feature 추출
-  Bridge (trainable): DINOv2 → Decoder 형식 변환
+  Bridge (trainable): DINOv2 → Decoder 형식 변환  [InstanceNorm2d]
   Decoder (trainable): feature → melanin / hemoglobin
 
 입력 : RGB linear [B, 3, H, W]
@@ -11,12 +12,85 @@ ChromophoreNet
        hem_pred   [B, 1, H, W]
        (선택) cls_feat   [B, 768]      ← AmbientInvariantLoss용
        (선택) patch_feat [B, N, 768]   ← AmbientInvariantLoss용
+       (선택) log_rgb    [B, 3, H, W]  ← IlluminantConsistencyLoss용
+
+변경 사항 (illumination robustness)
+------------------------------------
+1. LogAbsorbanceInput : RGB → -log(RGB) [OD] + log-ratio 채널
+   - Beer-Lambert: log(RGB) = log(illuminant) - OD  → 조명이 additive offset
+   - 채널 log-ratio (log(R/G), log(G/B)): 조명 독립적
+   - 5ch → 3ch 학습 가능 projection으로 DINOv2 입력 생성
+2. InstanceNorm2d (affine=True): Bridge refine conv 후 배치 통계 대신
+   인스턴스 통계로 정규화 → 이미지별 전역 조명 offset 제거
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Log-Absorbance Input Preprocessing
+# ══════════════════════════════════════════════════════════════════════════════
+class LogAbsorbanceInput(nn.Module):
+    """
+    RGB linear → log-absorbance 도메인 전처리
+
+    Beer-Lambert 법칙:
+        RGB = illuminant × exp(-OD)
+        log(RGB) = log(illuminant) − OD
+
+    조명이 log 도메인에서 additive offset이 되므로:
+      - InstanceNorm이 global offset(조명)을 효과적으로 제거
+      - 채널 차이(log-ratio)는 중성 조명 가정 시 조명에 무관
+
+    입력 [B, 3, H, W] (linear RGB, 0~1)
+    출력
+      dino_in  [B, 3, H, W] : DINOv2 입력 (학습 가능 5→3 projection)
+      log_rgb  [B, 3, H, W] : log(RGB+ε), IlluminantConsistencyLoss용
+
+    Parameters
+    ----------
+    eps : log 연산 수치 안정성 (기본 1e-6)
+    """
+
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        # OD 3ch + log-ratio 2ch → DINOv2 입력 3ch
+        self.proj = nn.Conv2d(5, 3, kernel_size=1, bias=True)
+        self._init_proj()
+
+    def _init_proj(self):
+        """초기값: OD 채널을 그대로 통과하도록 설정"""
+        with torch.no_grad():
+            nn.init.zeros_(self.proj.weight)
+            # OD 채널 (0,1,2) → 출력 채널 (0,1,2) 직접 연결
+            self.proj.weight[0, 0, 0, 0] = 1.0
+            self.proj.weight[1, 1, 0, 0] = 1.0
+            self.proj.weight[2, 2, 0, 0] = 1.0
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, rgb: torch.Tensor) -> tuple:
+        """
+        Returns
+        -------
+        dino_in : [B, 3, H, W]  DINOv2 입력
+        log_rgb : [B, 3, H, W]  log(RGB)  ← IlluminantConsistencyLoss에 전달
+        """
+        rgb_safe = rgb.clamp(min=self.eps)
+        log_rgb  = torch.log(rgb_safe)             # [B, 3, H, W]
+        od       = -log_rgb                         # optical density estimate
+
+        # 채널 log-ratio: 중성 조명 가정 시 조명 독립
+        rg = log_rgb[:, 0:1, :, :] - log_rgb[:, 1:2, :, :]   # log(R/G)
+        gb = log_rgb[:, 1:2, :, :] - log_rgb[:, 2:3, :, :]   # log(G/B)
+
+        feat5   = torch.cat([od, rg, gb], dim=1)   # [B, 5, H, W]
+        dino_in = self.proj(feat5)                  # [B, 3, H, W]
+
+        return dino_in, log_rgb
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -55,10 +129,12 @@ class DINOv2Bridge(nn.Module):
         ])
 
         # spatial refinement conv
+        # InstanceNorm2d: 이미지별 통계 정규화 → 전역 조명 offset 제거
+        # affine=True: 학습 가능한 scale/shift 유지
         self.refines = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(ch, ch, 3, padding=1, bias=False),
-                nn.BatchNorm2d(ch),
+                nn.InstanceNorm2d(ch, affine=True),
                 nn.ReLU(inplace=True),
             )
             for ch in dec_chs
@@ -121,6 +197,10 @@ class ChromophoreNet(nn.Module):
                  freeze_dino : bool = True):
         super().__init__()
 
+        # ── Log-Absorbance Preprocessing ──────────────────────────────────────
+        # RGB → OD + log-ratio → DINOv2 입력 (학습 가능)
+        self.log_input = LogAbsorbanceInput(eps=1e-6)
+
         # ── DINOv2 ────────────────────────────────────────────────────────────
         self.dinov2 = AutoModel.from_pretrained(
             dinov2_path, local_files_only=True
@@ -145,8 +225,9 @@ class ChromophoreNet(nn.Module):
         """
         Parameters
         ----------
-        rgb         : [B, 3, H, W] linear RGB
-        return_feat : True → feature도 반환 (AmbientInvariantLoss용)
+        rgb         : [B, 3, H, W] linear RGB (0~1)
+        return_feat : True → feature + log_rgb 반환
+                      (AmbientInvariantLoss / IlluminantConsistencyLoss용)
 
         Returns
         -------
@@ -154,27 +235,32 @@ class ChromophoreNet(nn.Module):
           mel_pred, hem_pred
 
         return_feat=True:
-          mel_pred, hem_pred, cls_feat, patch_feat
+          mel_pred, hem_pred, cls_feat, patch_feat, log_rgb
 
-          cls_feat   : [B, 768]    CLS token  (전체 이미지 표현)
-          patch_feat : [B, N, 768] patch tokens (공간 표현)
+          cls_feat   : [B, 768]    CLS token
+          patch_feat : [B, N, 768] patch tokens
+          log_rgb    : [B, 3, H, W] log(RGB) ← IlluminantConsistencyLoss에 전달
         """
-        # DINOv2: feature 추출
-        dino_out      = self.dinov2(rgb, output_hidden_states=True)
-        hidden_states = dino_out.hidden_states  # tuple [B, N+1, 768]
+        # Log-Absorbance 전처리
+        # dino_in: OD + log-ratio 기반 DINOv2 입력
+        # log_rgb: Beer-Lambert 잔차 계산용
+        dino_in, log_rgb = self.log_input(rgb)
 
-        # Bridge: 형식 변환
+        # DINOv2: feature 추출 (log-absorbance 입력)
+        dino_out      = self.dinov2(dino_in, output_hidden_states=True)
+        hidden_states = dino_out.hidden_states   # tuple [B, N+1, 768]
+
+        # Bridge: 형식 변환 (InstanceNorm2d)
         features = self.bridge(hidden_states)
 
         # Decoder: mel/hem 분리
         mel_pred, hem_pred = self.decoder(features)
 
         if return_feat:
-            # 마지막 레이어 feature 반환
-            last_hidden  = hidden_states[-1]           # [B, N+1, 768]
-            cls_feat     = last_hidden[:, 0,  :]       # [B, 768]
-            patch_feat   = last_hidden[:, 1:, :]       # [B, N, 768]
-            return mel_pred, hem_pred, cls_feat, patch_feat
+            last_hidden = hidden_states[-1]          # [B, N+1, 768]
+            cls_feat    = last_hidden[:, 0,  :]      # [B, 768]
+            patch_feat  = last_hidden[:, 1:, :]      # [B, N, 768]
+            return mel_pred, hem_pred, cls_feat, patch_feat, log_rgb
 
         return mel_pred, hem_pred
 
@@ -205,10 +291,13 @@ def build_model(dinov2_path : str,
     trainable = sum(p.numel() for p in model.parameters()
                     if p.requires_grad)
 
+    log_params = sum(p.numel() for p in model.log_input.parameters())
     print(f"\n=== 모델 파라미터 ===")
-    print(f"  DINOv2  (frozen)  : {(total-trainable)/1e6:.1f}M")
-    print(f"  Bridge + Decoder  : {trainable/1e6:.1f}M  ← 학습 대상")
-    print(f"  전체              : {total/1e6:.1f}M\n")
+    print(f"  DINOv2  (frozen)        : {(total-trainable)/1e6:.1f}M")
+    print(f"  LogAbsorbanceInput      : {log_params/1e3:.1f}K  (5→3 projection)")
+    print(f"  Bridge (InstanceNorm)   : ")
+    print(f"  Bridge + Decoder + Log  : {trainable/1e6:.1f}M  ← 학습 대상")
+    print(f"  전체                    : {total/1e6:.1f}M\n")
 
     return model
 
