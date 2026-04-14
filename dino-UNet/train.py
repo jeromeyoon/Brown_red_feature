@@ -97,24 +97,38 @@ def make_ambient_batch(rgb      : torch.Tensor,
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 2 전환: Optimizer에 DINOv2 파라미터 추가
 # ══════════════════════════════════════════════════════════════════════════════
-def enter_phase2(model, optimizer, cfg):
+def enter_phase2(model, optimizer, scheduler, cfg):
     """
     DINOv2 마지막 N 블록 unfreeze 후 Optimizer에 파라미터 그룹 추가
 
     기존 optimizer param_groups 유지 + DINOv2 그룹 추가
     → Adapter/Decoder lr과 DINOv2 lr을 분리 관리
+
+    Note: scheduler는 param_group 추가 후 last_epoch를 보정합니다.
+    CosineAnnealingLR은 add_param_group 시점의 lr을 그대로 유지하므로
+    DINOv2 그룹은 lr_dino에서 시작해 남은 epoch 동안 cosine decay됩니다.
     """
     model.unfreeze_dino(last_n_blocks=cfg['unfreeze_last'])
 
+    remaining_epochs = cfg['epochs'] - cfg['phase2_start_epoch'] + 1
     dino_params = [p for p in model.dinov2.parameters() if p.requires_grad]
     optimizer.add_param_group({
-        'params'      : dino_params,
-        'lr'          : cfg['lr_dino'],
-        'weight_decay': cfg['weight_decay'],
+        'params'            : dino_params,
+        'lr'                : cfg['lr_dino'],
+        'weight_decay'      : cfg['weight_decay'],
+        'initial_lr'        : cfg['lr_dino'],
     })
+
+    # Phase 2 진입 시점부터 DINOv2 그룹도 cosine decay 적용되도록
+    # scheduler의 T_max를 남은 epoch 기준으로 재설정
+    scheduler.T_max      = remaining_epochs
+    scheduler.last_epoch = 0
+    scheduler.base_lrs   = [g['initial_lr'] for g in optimizer.param_groups]
+
     print(f"  Phase 2 진입: DINOv2 마지막 {cfg['unfreeze_last']}블록 unfreeze")
     print(f"  DINOv2 lr = {cfg['lr_dino']:.1e}  |  "
           f"Adapter/Decoder lr = {cfg['lr']:.1e}")
+    print(f"  남은 epoch {remaining_epochs}동안 cosine decay 적용")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -309,7 +323,7 @@ def main():
 
         # Phase 2 전환
         if epoch == CFG['phase2_start_epoch'] and not in_phase2:
-            enter_phase2(model, optimizer, CFG)
+            enter_phase2(model, optimizer, scheduler, CFG)
             in_phase2 = True
 
         # Chromophore Loss 가중치 단계적 조절

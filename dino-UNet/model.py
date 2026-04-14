@@ -110,9 +110,11 @@ class FeatureAdapter(nn.Module):
     LAYER_INDICES = [3, 6, 9, 12]
 
     def __init__(self,
-                 dino_dim : int  = 768,
-                 dec_chs  : list = [512, 256, 128, 64],
-                 img_size : int  = 224):
+                 dino_dim : int        = 768,
+                 dec_chs  : list | None = None,
+                 img_size : int        = 224):
+        if dec_chs is None:
+            dec_chs = [512, 256, 128, 64]
         super().__init__()
 
         self.target_sizes = [
@@ -141,10 +143,18 @@ class FeatureAdapter(nn.Module):
 
     def _to_spatial(self, tokens: torch.Tensor,
                     size: tuple) -> torch.Tensor:
-        """[B, N, C] → [B, C, H, W]"""
+        """[B, N, C] → [B, C, H, W]
+
+        Note: N = h_patch * w_patch (정사각형 입력 가정: h_patch == w_patch)
+        직사각형 입력 사용 시 img_h, img_w를 별도로 관리해야 합니다.
+        """
         B, N, C = tokens.shape
-        h = w   = int(N ** 0.5)
-        x = tokens.permute(0, 2, 1).reshape(B, C, h, w)
+        h_patch = int(N ** 0.5)
+        assert h_patch * h_patch == N, (
+            f"토큰 수 {N}이 정사각형이 아닙니다. "
+            f"직사각형 입력은 지원하지 않습니다."
+        )
+        x = tokens.permute(0, 2, 1).reshape(B, C, h_patch, h_patch)
         return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
 
     def forward(self, hidden_states: tuple) -> list:
@@ -184,14 +194,12 @@ class UNetDecoder(nn.Module):
       최종 Conv → mel(1ch) + hem(1ch)
     """
 
-    def __init__(self, dec_chs: list = [512, 256, 128, 64]):
+    def __init__(self, dec_chs: list | None = None):
         super().__init__()
+        if dec_chs is None:
+            dec_chs = [512, 256, 128, 64]
 
         b, s3, s2, s1 = dec_chs   # [512, 256, 128, 64]
-
-        self.up1 = UpBlock(b,  s3, s3 // 2)    # 512 → 128
-        self.up2 = UpBlock(s3 // 2 * 2, s2, s2 // 2)  # needs adjustment
-        self.up3 = UpBlock(s2 // 2 * 2, s1, s1 // 2)
 
         # up1: in=512 → upsample to 256, cat skip3(256) → conv to 256
         # up2: in=256 → upsample to 128, cat skip2(128) → conv to 128
@@ -264,11 +272,13 @@ class DinoUNet(nn.Module):
 
     def __init__(self,
                  dinov2_path  : str,
-                 dec_chs      : list = [512, 256, 128, 64],
-                 img_size     : int  = 224,
-                 freeze_dino  : bool = True,
-                 unfreeze_last: int  = None):
+                 dec_chs      : list | None = None,
+                 img_size     : int         = 224,
+                 freeze_dino  : bool        = True,
+                 unfreeze_last: int         = None):
         super().__init__()
+        if dec_chs is None:
+            dec_chs = [512, 256, 128, 64]
 
         # ── DINOv2 ────────────────────────────────────────────────────────────
         self.dinov2 = AutoModel.from_pretrained(
@@ -361,10 +371,10 @@ class DinoUNet(nn.Module):
 # Builder
 # ══════════════════════════════════════════════════════════════════════════════
 def build_dino_unet(dinov2_path  : str,
-                    dec_chs      : list = [512, 256, 128, 64],
-                    img_size     : int  = 224,
-                    freeze_dino  : bool = True,
-                    unfreeze_last: int  = None) -> DinoUNet:
+                    dec_chs      : list | None = None,
+                    img_size     : int         = 224,
+                    freeze_dino  : bool        = True,
+                    unfreeze_last: int         = None) -> DinoUNet:
     """
     DinoUNet 생성 + 파라미터 통계 출력
 
