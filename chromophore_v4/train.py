@@ -51,22 +51,26 @@ CFG = dict(
     num_workers     = 8,
 
     # Feature Consistency Loss 설정
+    # freeze_dino=True 여도 gradient는 DINOv2를 통과하여 LogAbsorbanceInput.proj 까지
+    # 전달됨. AmbientInvariantLoss는 5→3 projection이 조명 불변 표현을 만들도록 학습.
     feat_loss_type  = 'cosine',   # 'cosine' | 'mse' | 'infonce'
-    feat_temperature= 0.07,       # InfoNCE 온도 (cosine/mse는 무시)
-    use_patch_feat  = False,      # patch token도 consistency loss에 사용
-    patch_feat_w    = 0.5,        # patch token loss 가중치
-    w_feat          = 0.5,        # feature consistency loss 전체 가중치
+    feat_temperature= 0.07,
+    use_patch_feat  = False,
+    patch_feat_w    = 0.5,
+    w_feat          = 0.3,        # LogAbsorbanceInput 조명 불변 학습용
 
     # Illuminant Consistency Loss 설정 (Beer-Lambert 잔차 기반)
-    w_illum         = 0.3,        # illuminant loss 전체 가중치
-    illum_smooth    = 1.0,        # 공간 평활도 가중치
-    illum_spectral  = 0.5,        # 스펙트럼 일관성 가중치
-    illum_augment   = 1.0,        # 조명 뷰 간 일관성 가중치
+    # NOTE: ChromophoreLoss의 recon term과 gradient 충돌 유발.
+    #       base 모델 수렴 후 fine-tuning 단계에서 w_illum > 0 으로 활성화.
+    w_illum         = 0.0,        # 비활성화 (fine-tuning 단계에서 0.2~0.3으로 설정)
+    illum_smooth    = 1.0,
+    illum_spectral  = 0.5,
+    illum_augment   = 1.0,
 
     # Chromophore Loss 초기 가중치 (get_loss_weights로 단계적 조절)
     w_supervised    = 1.0,
     w_ssim          = 0.0,
-    w_recon         = 0.5,
+    w_recon         = 0.3,
     w_ortho         = 0.0,
     w_smooth        = 0.0,
 )
@@ -193,9 +197,13 @@ def train_one_epoch(model, loader, chroma_loss, feat_loss, illum_loss,
         )
 
         # ── 합산 ────────────────────────────────────────────────────────────
-        total = (loss_c
-                 + cfg['w_feat']  * loss_f
-                 + cfg['w_illum'] * loss_i)
+        # base 학습: ChromophoreLoss(sup+recon+smooth+ortho) 만 사용
+        # fine-tuning 전환 시: w_feat, w_illum 을 CFG에서 0 이상으로 설정
+        total = loss_c
+        if cfg['w_feat'] > 0:
+            total = total + cfg['w_feat'] * loss_f
+        if cfg['w_illum'] > 0:
+            total = total + cfg['w_illum'] * loss_i
 
         optimizer.zero_grad()
         total.backward()
@@ -264,9 +272,11 @@ def validate(model, loader, chroma_loss, feat_loss, illum_loss,
             hem_aug     = hem_aug,
         )
 
-        total = (loss_c
-                 + cfg['w_feat']  * loss_f
-                 + cfg['w_illum'] * loss_i)
+        total = loss_c
+        if cfg['w_feat'] > 0:
+            total = total + cfg['w_feat'] * loss_f
+        if cfg['w_illum'] > 0:
+            total = total + cfg['w_illum'] * loss_i
         total_loss += total.item()
 
         for k in chroma_log:

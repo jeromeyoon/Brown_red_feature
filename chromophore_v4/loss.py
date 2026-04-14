@@ -471,9 +471,13 @@ def get_loss_weights(epoch: int, total_epochs: int) -> dict:
     """
     학습 단계에 따라 Loss 가중치 조절
 
-    Phase 1 (0~30%)  : Supervised + Recon → 빠른 수렴
-    Phase 2 (30~70%) : SSIM + Ortho + feat consistency 추가
-    Phase 3 (70~100%): 전체 Loss 적용
+    Phase 1 (0~40%)  : Supervised L1 + Recon 만 사용 → 빠른 수렴
+    Phase 2 (40~80%) : Smoothness TV 추가 (공간 연속성)
+    Phase 3 (80~100%): Orthogonality 추가 (mel/hem 독립성 미세 정제)
+
+    SSIM은 L1과 중복되어 gradient 충돌을 유발하므로 제거.
+    AmbientInvariantLoss / IlluminantConsistencyLoss는 base 수렴 후
+    별도 fine-tuning 단계에서 활성화 권장 (train.py 참고).
 
     Usage
     -----
@@ -483,18 +487,21 @@ def get_loss_weights(epoch: int, total_epochs: int) -> dict:
     """
     progress = epoch / total_epochs
 
-    if progress < 0.3:
+    if progress < 0.4:
+        # Phase 1: 직접 지도 + Beer-Lambert 물리 제약만
         return dict(
             w_supervised = 1.0, w_ssim  = 0.0,
-            w_recon      = 0.5, w_ortho = 0.0, w_smooth = 0.0
+            w_recon      = 0.3, w_ortho = 0.0, w_smooth = 0.0
         )
-    elif progress < 0.7:
+    elif progress < 0.8:
+        # Phase 2: 공간 평활도 추가
         return dict(
-            w_supervised = 1.0, w_ssim  = 0.3,
-            w_recon      = 0.5, w_ortho = 0.2, w_smooth = 0.1
+            w_supervised = 1.0, w_ssim  = 0.0,
+            w_recon      = 0.3, w_ortho = 0.0, w_smooth = 0.05
         )
     else:
+        # Phase 3: mel/hem 직교성 미세 정제
         return dict(
-            w_supervised = 1.0, w_ssim  = 0.5,
-            w_recon      = 0.5, w_ortho = 0.3, w_smooth = 0.1
+            w_supervised = 1.0, w_ssim  = 0.0,
+            w_recon      = 0.3, w_ortho = 0.05, w_smooth = 0.05
         )
